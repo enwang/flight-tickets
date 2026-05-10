@@ -1,0 +1,17 @@
+# Credentials — never commit
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Browser session (contains login cookies)
+browser_profiles/
+
+# Generated output
+reports/
+.playwright-mcp/
+
+# macOS
+.DS_Store
