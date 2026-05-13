@@ -402,9 +402,17 @@ def _scrape_month_prices(page: Any, month_name: str, start_day: int, end_day: in
     return prices
 
 
-def _best_from_day_values(label: str, values: dict[int, float]) -> FareResult:
+def _best_from_day_values(label: str, values: dict[int, float], samples_checked: int = 0) -> FareResult:
     if not values:
-        return FareResult(None, None, None, None, _united_results_url(OUTBOUND_START), 0, "united.com browser")
+        return FareResult(
+            None,
+            None,
+            None,
+            None,
+            _united_results_url(OUTBOUND_START),
+            samples_checked,
+            "united.com browser",
+        )
     best_day = min(values, key=lambda day: values[day])
     depart = dt.date(OUTBOUND_START.year, OUTBOUND_START.month, best_day)
     return FareResult(
@@ -413,7 +421,7 @@ def _best_from_day_values(label: str, values: dict[int, float]) -> FareResult:
         depart_date=depart.isoformat(),
         return_date=None,
         url=_united_results_url(depart),
-        samples_checked=len(values),
+        samples_checked=samples_checked or len(values),
         api_source="united.com browser",
     )
 
@@ -633,7 +641,7 @@ def _extract_calendar_day_miles(text: str, day: int, *, nonstop_only: bool = Tru
     return min(values) if values else None
 
 
-def _wait_for_results(page: Any, timeout_ms: int = 90000) -> None:
+def _wait_for_results(page: Any, timeout_ms: int = 45000) -> None:
     try:
         page.wait_for_function(
             """() => {
@@ -690,41 +698,56 @@ def _set_date_via_calendar(page: Any, out_date: dt.date) -> None:
 
 
 def _search_united_award(page: Any, out_date: dt.date) -> None:
-    """Fill in and submit United's award search form for one-way SFO->PVG."""
-    _goto_with_retry(page, "https://www.united.com/en/us/", attempts=2)
-    page.wait_for_timeout(5000)
-    _ensure_united_signed_in(page)
+    """Submit United's homepage award search form for one-way SFO->PVG."""
+    for attempt in range(2):
+        _goto_with_retry(page, "https://www.united.com/en/us/", attempts=2)
+        page.wait_for_timeout(5000)
+        _ensure_united_signed_in(page)
 
-    # Enable "Book with miles" (award) checkbox — id="award"
-    award_cb = page.locator("#award")
-    if award_cb.count() and not award_cb.is_checked():
-        award_cb.click(timeout=5000)
-        page.wait_for_timeout(1000)
+        award_cb = page.locator("#award")
+        if award_cb.count() and not award_cb.is_checked():
+            award_cb.click(timeout=5000)
+            page.wait_for_timeout(500)
 
-    # Set one-way — id="radiofield-item-id-flightType-1"
-    oneway = page.locator("#radiofield-item-id-flightType-1")
-    if oneway.count() and not oneway.is_checked():
-        oneway.click(timeout=5000)
+        oneway = page.locator("#radiofield-item-id-flightType-1")
+        if oneway.count() and not oneway.is_checked():
+            oneway.click(timeout=5000)
+            page.wait_for_timeout(500)
+
+        origin_val = page.locator("#bookFlightOriginInput").input_value() or ""
+        if ORIGIN not in origin_val:
+            _choose_airport(page, "bookFlightOriginInput", r"San Francisco.*SFO", ORIGIN)
+
+        dest_val = page.locator("#bookFlightDestinationInput").input_value() or ""
+        if DEST not in dest_val:
+            _choose_airport(page, "bookFlightDestinationInput", r"Shanghai.*PVG", DEST)
+
+        date_input = page.locator("#DepartDate_start")
+        date_input.fill(f"{out_date.strftime('%b')} {out_date.day}", timeout=5000)
+        date_input.press("Tab", timeout=5000)
         page.wait_for_timeout(500)
 
-    # Fill origin (only if not already set correctly)
-    origin_val = page.locator("#bookFlightOriginInput").input_value() or ""
-    if ORIGIN not in origin_val:
-        _choose_airport(page, "bookFlightOriginInput", r"San Francisco.*SFO", ORIGIN)
+        try:
+            page.get_by_role("button", name=re.compile(r"^Find flights?$", re.I)).first.click(timeout=10000)
+        except Exception:
+            page.locator('button[type="submit"]').first.click(timeout=5000)
 
-    # Fill destination
-    dest_val = page.locator("#bookFlightDestinationInput").input_value() or ""
-    if DEST not in dest_val:
-        _choose_airport(page, "bookFlightDestinationInput", r"Shanghai.*PVG", DEST)
+        _wait_for_results(page)
 
-    # Set departure date via calendar
-    _set_date_via_calendar(page, out_date)
+        text = page.locator("body").inner_text(timeout=10000)
+        if "Loading results" not in text or "Flight Information" in text:
+            return
+        if attempt == 0:
+            page.wait_for_timeout(5000)
 
-    # Submit
-    try:
-        page.get_by_role("button", name=re.compile(r"^Find flights?$|^Search$", re.I)).first.click(timeout=10000)
-    except Exception:
-        page.locator('button[type="submit"]').first.click(timeout=5000)
+    raise TimeoutError(f"United results did not finish loading for {out_date.isoformat()}")
+
+
+def _cabin_patterns() -> dict[str, str]:
+    return {
+        "economy": r"United Economy\b",
+        "premium_economy": r"(?:United )?Premium Plus\b",
+    }
 
 
 def _scrape_results_window(page: Any, label: str, key: str) -> FareResult:
@@ -733,13 +756,16 @@ def _scrape_results_window(page: Any, label: str, key: str) -> FareResult:
         "premium_economy": r"(?:United )?Premium Plus\b",
     }
     miles_by_day: dict[int, float] = {}
+    samples_checked = 0
     for out_date in daterange(OUTBOUND_START, OUTBOUND_END):
+        samples_checked += 1
         try:
             _search_united_award(page, out_date)
-            _wait_for_results(page)
             text = page.locator("body").inner_text(timeout=10000)
         except RuntimeError:
             raise
+        except TimeoutError:
+            continue
         except Exception:
             continue
         miles = _extract_result_miles(text, cabin_patterns[key], nonstop_only=True)
@@ -747,7 +773,40 @@ def _scrape_results_window(page: Any, label: str, key: str) -> FareResult:
             miles = _extract_calendar_day_miles(text, out_date.day, nonstop_only=True)
         if miles is not None:
             miles_by_day[out_date.day] = miles
-    return _best_from_day_values(label, miles_by_day)
+    return _best_from_day_values(label, miles_by_day, samples_checked)
+
+
+def _scrape_all_cabins_window(page: Any) -> dict[str, FareResult]:
+    cabin_patterns = _cabin_patterns()
+    miles_by_key: dict[str, dict[int, float]] = {
+        key: {}
+        for _, _, key in TRACKED_CLASSES
+    }
+    samples_checked = 0
+
+    for out_date in daterange(OUTBOUND_START, OUTBOUND_END):
+        samples_checked += 1
+        try:
+            _search_united_award(page, out_date)
+            text = page.locator("body").inner_text(timeout=10000)
+        except RuntimeError:
+            raise
+        except TimeoutError:
+            continue
+        except Exception:
+            continue
+
+        for _, _, key in TRACKED_CLASSES:
+            miles = _extract_result_miles(text, cabin_patterns[key], nonstop_only=True)
+            if miles is None and key == "economy":
+                miles = _extract_calendar_day_miles(text, out_date.day, nonstop_only=True)
+            if miles is not None:
+                miles_by_key[key][out_date.day] = miles
+
+    return {
+        key: _best_from_day_values(label, miles_by_key[key], samples_checked)
+        for label, _, key in TRACKED_CLASSES
+    }
 
 
 def find_united_browser_calendar_fares(headless: bool = False) -> dict[str, FareResult]:
@@ -778,11 +837,7 @@ def find_united_browser_calendar_fares(headless: bool = False) -> dict[str, Fare
             except Exception:
                 pass
 
-            for idx, (label, _, key) in enumerate(TRACKED_CLASSES):
-                scan_page = page if idx == 0 else context.new_page()
-                results[key] = _scrape_results_window(scan_page, label, key)
-                if scan_page is not page:
-                    scan_page.close()
+            results.update(_scrape_all_cabins_window(page))
         finally:
             context.close()
 
@@ -1171,7 +1226,7 @@ def _buy_signal(current: float, history: list[float]) -> str:
 
 
 def _is_deal_signal(signal: str) -> bool:
-    return signal.startswith("Very good price") or signal.startswith("Good price")
+    return signal.startswith("Very good mileage") or signal.startswith("Good mileage")
 
 
 def build_price_context(
