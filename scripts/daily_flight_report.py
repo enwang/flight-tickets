@@ -509,7 +509,7 @@ def _click_visible_button(page: Any, pattern: re.Pattern[str]) -> bool:
 def _login_prompt_visible(page: Any, text: str) -> bool:
     if "You must be signed-in" in text:
         return True
-    for selector in ("#MPIDEmailField", 'input[type="password"]'):
+    for selector in ("#MPIDEmailField", 'input[type="password"]', 'input[type="email"]'):
         locator = page.locator(selector)
         try:
             for idx in range(locator.count()):
@@ -698,39 +698,12 @@ def _set_date_via_calendar(page: Any, out_date: dt.date) -> None:
 
 
 def _search_united_award(page: Any, out_date: dt.date) -> None:
-    """Submit United's homepage award search form for one-way SFO->PVG."""
+    """Navigate directly to United's award results URL for one-way SFO->PVG."""
+    url = _united_results_url(out_date)
     for attempt in range(2):
-        _goto_with_retry(page, "https://www.united.com/en/us/", attempts=2)
-        page.wait_for_timeout(5000)
+        _goto_with_retry(page, url, attempts=2)
+        page.wait_for_timeout(3000)
         _ensure_united_signed_in(page)
-
-        award_cb = page.locator("#award")
-        if award_cb.count() and not award_cb.is_checked():
-            award_cb.click(timeout=5000)
-            page.wait_for_timeout(500)
-
-        oneway = page.locator("#radiofield-item-id-flightType-1")
-        if oneway.count() and not oneway.is_checked():
-            oneway.click(timeout=5000)
-            page.wait_for_timeout(500)
-
-        origin_val = page.locator("#bookFlightOriginInput").input_value() or ""
-        if ORIGIN not in origin_val:
-            _choose_airport(page, "bookFlightOriginInput", r"San Francisco.*SFO", ORIGIN)
-
-        dest_val = page.locator("#bookFlightDestinationInput").input_value() or ""
-        if DEST not in dest_val:
-            _choose_airport(page, "bookFlightDestinationInput", r"Shanghai.*PVG", DEST)
-
-        date_input = page.locator("#DepartDate_start")
-        date_input.fill(f"{out_date.strftime('%b')} {out_date.day}", timeout=5000)
-        date_input.press("Tab", timeout=5000)
-        page.wait_for_timeout(500)
-
-        try:
-            page.get_by_role("button", name=re.compile(r"^Find flights?$", re.I)).first.click(timeout=10000)
-        except Exception:
-            page.locator('button[type="submit"]').first.click(timeout=5000)
 
         _wait_for_results(page)
 
