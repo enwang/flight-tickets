@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Daily award tracker for United SFO -> Shanghai with flexible date scanning.
+"""Daily award + revenue tracker for United SFO -> Shanghai.
 
-Tracks:
-- Cheapest one-way nonstop Economy mileage award for the last week of September
-- Cheapest one-way nonstop Premium Economy mileage award for the last week of September
+Tracks per window:
+- Cheapest one-way nonstop Economy mileage award
+- Cheapest one-way nonstop Premium economy mileage award
+- Cheapest one-way nonstop Economy cash fare
+- Cheapest one-way nonstop Premium economy cash fare
 - Deal signals based on this tracker's own historical low and average
 
 Date windows:
-- Outbound: 2026-09-24 .. 2026-09-30
+- 2026-06-20 .. 2026-06-27
+- 2026-09-24 .. 2026-09-30
 """
 
 from __future__ import annotations
@@ -32,14 +35,40 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 REPORT_DIR = BASE_DIR / "reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 PRICE_HISTORY_FILE = REPORT_DIR / "price_history.jsonl"
+EMAIL_LOG_FILE = REPORT_DIR / "email_log.jsonl"
+SCRAPE_DEBUG_FILE = REPORT_DIR / "scrape_debug.jsonl"
 UA_BROWSER_PROFILE_DIR = BASE_DIR / "browser_profiles" / "united_playwright"
+UA_FIREFOX_PROFILE_DIR = BASE_DIR / "browser_profiles" / "united_firefox"
 REPORT_SEND_NOT_BEFORE_HOUR = 8
 REPORT_SEND_NOT_BEFORE_MINUTE = 0
 
-OUTBOUND_START = dt.date(2026, 9, 24)
-OUTBOUND_END = dt.date(2026, 9, 30)
-RETURN_START = dt.date(2026, 9, 24)
-RETURN_END = dt.date(2026, 9, 30)
+# Each entry declares the date window plus, per fare mode, the cabins we want
+# scraped. Omit a mode entirely to skip it for that window.
+TRACKED_WINDOWS: list[dict[str, Any]] = [
+    {
+        "label": "Jun 20-27",
+        "start": dt.date(2026, 6, 20),
+        "end": dt.date(2026, 6, 27),
+        "modes": {
+            "miles": ("economy",),
+            "cash": ("economy",),
+        },
+    },
+    {
+        "label": "Sep 24-30",
+        "start": dt.date(2026, 9, 24),
+        "end": dt.date(2026, 9, 30),
+        "modes": {
+            "miles": ("economy", "premium_economy"),
+        },
+    },
+]
+
+# Legacy single-window aliases retained for unused SerpAPI/Kiwi helpers below.
+OUTBOUND_START = TRACKED_WINDOWS[-1]["start"]
+OUTBOUND_END = TRACKED_WINDOWS[-1]["end"]
+RETURN_START = TRACKED_WINDOWS[-1]["start"]
+RETURN_END = TRACKED_WINDOWS[-1]["end"]
 
 ORIGIN = "SFO"
 DEST = "PVG"
@@ -50,6 +79,7 @@ TRACKED_CLASSES = (
     ("Economy", 1, "economy"),
     ("Premium economy", 2, "premium_economy"),
 )
+FARE_MODES: tuple[str, ...] = ("miles", "cash")
 
 
 @dataclass
@@ -61,6 +91,11 @@ class FareResult:
     url: str | None
     samples_checked: int = 0
     api_source: str | None = None
+    # Populated by main() when price is None — last known value from history
+    # so the email always carries some signal even on a scrape failure.
+    fallback_price: float | None = None
+    fallback_depart_date: str | None = None
+    fallback_scraped_on: str | None = None
 
 
 def daterange(start: dt.date, end: dt.date) -> list[dt.date]:
@@ -402,31 +437,36 @@ def _scrape_month_prices(page: Any, month_name: str, start_day: int, end_day: in
     return prices
 
 
-def _best_from_day_values(label: str, values: dict[int, float], samples_checked: int = 0) -> FareResult:
+def _best_from_day_values(
+    values: dict[dt.date, float],
+    *,
+    mode: str,
+    fallback_date: dt.date,
+    samples_checked: int = 0,
+) -> FareResult:
     if not values:
         return FareResult(
             None,
             None,
             None,
             None,
-            _united_results_url(OUTBOUND_START),
+            _united_results_url(fallback_date, mode=mode),
             samples_checked,
             "united.com browser",
         )
-    best_day = min(values, key=lambda day: values[day])
-    depart = dt.date(OUTBOUND_START.year, OUTBOUND_START.month, best_day)
+    best_date = min(values, key=lambda d: values[d])
     return FareResult(
-        price=values[best_day],
+        price=values[best_date],
         airline=TARGET_AIRLINE_NAME,
-        depart_date=depart.isoformat(),
+        depart_date=best_date.isoformat(),
         return_date=None,
-        url=_united_results_url(depart),
+        url=_united_results_url(best_date, mode=mode),
         samples_checked=samples_checked or len(values),
         api_source="united.com browser",
     )
 
 
-def _united_results_url(out_date: dt.date) -> str:
+def _united_results_url(out_date: dt.date, *, mode: str = "miles") -> str:
     params = {
         "f": ORIGIN,
         "t": DEST,
@@ -438,9 +478,10 @@ def _united_results_url(out_date: dt.date) -> str:
         "newHP": "True",
         "clm": "7",
         "st": "bestmatches",
-        "at": "1",
-        "tqp": "A",
+        "tqp": "A" if mode == "miles" else "R",
     }
+    if mode == "miles":
+        params["at"] = "1"
     return "https://www.united.com/en/us/fsr/choose-flights?" + urllib.parse.urlencode(params)
 
 
@@ -641,17 +682,27 @@ def _extract_calendar_day_miles(text: str, day: int, *, nonstop_only: bool = Tru
     return min(values) if values else None
 
 
-def _wait_for_results(page: Any, timeout_ms: int = 45000) -> None:
+def _wait_for_results(page: Any, *, mode: str = "miles", timeout_ms: int = 25000) -> None:
+    # Exit fast when UA shows its backend error, so we don't burn the whole
+    # timeout per dead page. Success markers differ by mode.
+    error_check = (
+        '|| body.includes("unable to complete your request") '
+        '|| body.includes("try again later")'
+    )
+    if mode == "miles":
+        js = """() => {
+            const body = document.body.innerText || "";
+            return (
+                body.includes("miles") && body.includes("Flight Information")
+            ) || body.includes("No flights found") || body.includes("no results")""" + error_check + ";\n        }"
+    else:
+        js = """() => {
+            const body = document.body.innerText || "";
+            return (
+                body.includes("$") && /\\bNON\\s*STOP\\b|\\b\\d+\\s+STOPS?\\b/.test(body)
+            ) || body.includes("No flights found") || body.includes("no results")""" + error_check + ";\n        }"
     try:
-        page.wait_for_function(
-            """() => {
-                const body = document.body.innerText || "";
-                return (
-                    body.includes("miles") && body.includes("Flight Information")
-                ) || body.includes("No flights found") || body.includes("no results");
-            }""",
-            timeout=timeout_ms,
-        )
+        page.wait_for_function(js, timeout=timeout_ms)
     except Exception:
         pass
 
@@ -697,18 +748,31 @@ def _set_date_via_calendar(page: Any, out_date: dt.date) -> None:
         pass
 
 
-def _search_united_award(page: Any, out_date: dt.date) -> None:
-    """Navigate directly to United's award results URL for one-way SFO->PVG."""
-    url = _united_results_url(out_date)
+_UA_BACKEND_ERROR_MARKERS = (
+    "unable to complete your request",
+    "try again later",
+)
+
+
+def _search_united_results(page: Any, out_date: dt.date, *, mode: str) -> None:
+    """Navigate directly to United's results URL for one-way SFO->PVG."""
+    url = _united_results_url(out_date, mode=mode)
+    success_markers = ("Flight Information",) if mode == "miles" else ("NONSTOP", "1 STOP", "2 STOPS")
     for attempt in range(2):
         _goto_with_retry(page, url, attempts=2)
         page.wait_for_timeout(3000)
-        _ensure_united_signed_in(page)
+        if mode == "miles":
+            _ensure_united_signed_in(page)
 
-        _wait_for_results(page)
+        _wait_for_results(page, mode=mode)
 
         text = page.locator("body").inner_text(timeout=10000)
-        if "Loading results" not in text or "Flight Information" in text:
+        if any(marker in text for marker in _UA_BACKEND_ERROR_MARKERS):
+            raise TimeoutError(
+                f"UA backend error for {out_date.isoformat()} ({mode}): "
+                "site returned 'unable to complete your request'"
+            )
+        if "Loading results" not in text or any(marker in text for marker in success_markers):
             return
         if attempt == 0:
             page.wait_for_timeout(5000)
@@ -716,73 +780,271 @@ def _search_united_award(page: Any, out_date: dt.date) -> None:
     raise TimeoutError(f"United results did not finish loading for {out_date.isoformat()}")
 
 
-def _cabin_patterns() -> dict[str, str]:
+def _cabin_patterns(mode: str) -> dict[str, str]:
+    if mode == "miles":
+        return {
+            "economy": r"United Economy\b",
+            "premium_economy": r"(?:United )?Premium Plus\b",
+        }
+    # Cash result cards
     return {
-        "economy": r"United Economy\b",
-        "premium_economy": r"(?:United )?Premium Plus\b",
+        "economy": r"\bEconomy\b(?!\s*Plus)",
+        "premium_economy": r"\bPremium\s*Plus\b",
     }
 
 
-def _scrape_results_window(page: Any, label: str, key: str) -> FareResult:
-    cabin_patterns = {
-        "economy": r"United Economy\b",
-        "premium_economy": r"(?:United )?Premium Plus\b",
-    }
-    miles_by_day: dict[int, float] = {}
+_STOP_MARKER_RE = re.compile(r"\b(NON\s*STOP|NONSTOP|\d+\s+STOPS?)\b", re.I)
+_CASH_FARE_TILE_RE = re.compile(
+    r"From\s*\n\s*\$([\d,]+)(?:\.\d{2})?\s*\n\s*([^\n]+)",
+    re.I,
+)
+
+
+def _nonstop_flight_chunks(text: str) -> list[str]:
+    """Split UA results text into per-flight chunks, keeping only nonstop ones."""
+    markers = list(_STOP_MARKER_RE.finditer(text))
+    chunks: list[str] = []
+    for idx, m in enumerate(markers):
+        if "NON" not in m.group(0).upper().replace(" ", ""):
+            continue
+        start = m.end()
+        end = markers[idx + 1].start() if idx + 1 < len(markers) else len(text)
+        chunks.append(text[start:end])
+    return chunks
+
+
+def _cash_cabin_key(label: str) -> str | None:
+    """Map a UA cabin label string to our cabin keys; ignore Polaris/First."""
+    low = label.lower()
+    if "polaris" in low or "first" in low or "business" in low:
+        return None
+    if "premium plus" in low:
+        return "premium_economy"
+    if "economy" in low:
+        return "economy"
+    return None
+
+
+def _extract_result_cash_by_cabin(text: str) -> dict[str, float]:
+    """Return {cabin_key: cheapest USD} parsed from UA cash results text."""
+    by_cabin: dict[str, list[float]] = {key: [] for _, _, key in TRACKED_CLASSES}
+    for chunk in _nonstop_flight_chunks(text):
+        for m in _CASH_FARE_TILE_RE.finditer(chunk):
+            try:
+                price = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            if price < 100:
+                continue
+            key = _cash_cabin_key(m.group(2))
+            if key is None:
+                continue
+            by_cabin[key].append(price)
+    return {key: min(vals) for key, vals in by_cabin.items() if vals}
+
+
+def _scrape_all_cabins_window(
+    page: Any,
+    window_start: dt.date,
+    window_end: dt.date,
+    mode: str,
+    cabin_keys: tuple[str, ...],
+    *,
+    window_label: str = "",
+) -> dict[str, FareResult]:
+    cabin_patterns = _cabin_patterns(mode)
+    by_key: dict[str, dict[dt.date, float]] = {key: {} for key in cabin_keys}
     samples_checked = 0
-    for out_date in daterange(OUTBOUND_START, OUTBOUND_END):
+
+    for out_date in daterange(window_start, window_end):
         samples_checked += 1
+        url = _united_results_url(out_date, mode=mode)
+        text: str | None = None
+        error: str | None = None
+        extracted: dict[str, float | None] = {key: None for key in cabin_keys}
+        t0 = time.monotonic()
         try:
-            _search_united_award(page, out_date)
+            _search_united_results(page, out_date, mode=mode)
             text = page.locator("body").inner_text(timeout=10000)
         except RuntimeError:
             raise
-        except TimeoutError:
-            continue
-        except Exception:
-            continue
-        miles = _extract_result_miles(text, cabin_patterns[key], nonstop_only=True)
-        if miles is None and key == "economy":
-            miles = _extract_calendar_day_miles(text, out_date.day, nonstop_only=True)
-        if miles is not None:
-            miles_by_day[out_date.day] = miles
-    return _best_from_day_values(label, miles_by_day, samples_checked)
+        except TimeoutError as e:
+            error = f"timeout: {e}"
+        except Exception as e:
+            error = f"exception: {e}"
 
+        if text and not error:
+            if mode == "miles":
+                for key in cabin_keys:
+                    price = _extract_result_miles(
+                        text, cabin_patterns[key], nonstop_only=True
+                    )
+                    if price is None and key == "economy":
+                        price = _extract_calendar_day_miles(
+                            text, out_date.day, nonstop_only=True
+                        )
+                    if price is not None:
+                        by_key[key][out_date] = price
+                        extracted[key] = price
+            else:
+                cash_by_cabin = _extract_result_cash_by_cabin(text)
+                for key in cabin_keys:
+                    if key in cash_by_cabin:
+                        by_key[key][out_date] = cash_by_cabin[key]
+                        extracted[key] = cash_by_cabin[key]
 
-def _scrape_all_cabins_window(page: Any) -> dict[str, FareResult]:
-    cabin_patterns = _cabin_patterns()
-    miles_by_key: dict[str, dict[int, float]] = {
-        key: {}
-        for _, _, key in TRACKED_CLASSES
-    }
-    samples_checked = 0
-
-    for out_date in daterange(OUTBOUND_START, OUTBOUND_END):
-        samples_checked += 1
-        try:
-            _search_united_award(page, out_date)
-            text = page.locator("body").inner_text(timeout=10000)
-        except RuntimeError:
-            raise
-        except TimeoutError:
-            continue
-        except Exception:
-            continue
-
-        for _, _, key in TRACKED_CLASSES:
-            miles = _extract_result_miles(text, cabin_patterns[key], nonstop_only=True)
-            if miles is None and key == "economy":
-                miles = _extract_calendar_day_miles(text, out_date.day, nonstop_only=True)
-            if miles is not None:
-                miles_by_key[key][out_date.day] = miles
+        log_scrape_attempt(
+            window_label=window_label,
+            out_date=out_date,
+            mode=mode,
+            url=url,
+            text=text,
+            extracted=extracted,
+            error=error,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+        )
 
     return {
-        key: _best_from_day_values(label, miles_by_key[key], samples_checked)
-        for label, _, key in TRACKED_CLASSES
+        key: _best_from_day_values(
+            by_key[key],
+            mode=mode,
+            fallback_date=window_start,
+            samples_checked=samples_checked,
+        )
+        for key in cabin_keys
     }
 
 
-def find_united_browser_calendar_fares(headless: bool = False) -> dict[str, FareResult]:
+_EXTRA_STEALTH_INIT_JS = r"""
+// Belt-and-suspenders fingerprint patches on top of playwright-stealth.
+// UA's results page loads invisible reCAPTCHA which silently blocks the
+// search submission when the score is low — these patches help the score.
+
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+if (!navigator.plugins || navigator.plugins.length === 0) {
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => ([
+            { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chromium PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        ]),
+    });
+}
+
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+const _originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (_originalQuery) {
+    window.navigator.permissions.query = (params) =>
+        params && params.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : _originalQuery(params);
+}
+
+window.chrome = window.chrome || {};
+window.chrome.runtime = window.chrome.runtime || {};
+window.chrome.app = window.chrome.app || { isInstalled: false };
+
+// Spoof hairline detection (reCAPTCHA sometimes probes this)
+const _getParameter = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Apple Inc.';
+    if (parameter === 37446) return 'Apple M2';
+    return _getParameter.apply(this, arguments);
+};
+"""
+
+
+_RECAPTCHA_COOKIE_PREFIXES = (
+    "_GRECAPTCHA",
+    "__gads",
+    "__gpi",
+    "__eoi",
+    "_ga",
+    "_gid",
+    "IDE",
+    "DSID",
+    "test_cookie",
+)
+
+
+def _minimize_chrome_for_profile(profile_path: str) -> int:
+    """Minimize Chrome windows belonging to the Playwright-launched instance.
+
+    Targets only processes whose argv contains ``user-data-dir=<profile_path>``
+    so the user's regular Chrome session is untouched. Returns the number of
+    AppleScript invocations that succeeded; 0 if the helper is unavailable
+    (e.g., accessibility permission not granted to Terminal/this app).
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", f"user-data-dir={profile_path}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return 0
+    pids = [p.strip() for p in out.stdout.split() if p.strip()]
+    minimized = 0
+    for pid in pids:
+        script = (
+            'tell application "System Events" to '
+            f'tell (first application process whose unix id is {pid}) '
+            'to set value of attribute "AXMinimized" of every window to true'
+        )
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                minimized += 1
+        except Exception:
+            continue
+    return minimized
+
+
+def _purge_recaptcha_cookies(context: Any) -> int:
+    """Remove third-party reputation cookies (reCAPTCHA, ad networks) while
+    leaving united.com session cookies alone. Returns number removed."""
+    try:
+        cookies = context.cookies()
+    except Exception:
+        return 0
+    keep: list[dict[str, Any]] = []
+    removed = 0
+    for c in cookies:
+        name = str(c.get("name", ""))
+        domain = str(c.get("domain", ""))
+        if any(name.startswith(p) for p in _RECAPTCHA_COOKIE_PREFIXES):
+            removed += 1
+            continue
+        # Drop cookies set by Google / ad networks even on first-party domains
+        if any(d in domain for d in ("google.com", "doubleclick", "gstatic")):
+            removed += 1
+            continue
+        keep.append(c)
+    try:
+        context.clear_cookies()
+        if keep:
+            context.add_cookies(keep)
+    except Exception:
+        pass
+    return removed
+
+
+def find_united_browser_calendar_fares(
+    headless: bool = False,
+) -> dict[str, dict[str, dict[str, FareResult]]]:
+    """Scrape United for every configured (window, mode, cabin) combination.
+
+    Returns: { window_label: { mode: { cabin_key: FareResult } } }
+    Only modes/cabins listed in each window's "modes" entry are scraped.
+    """
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
@@ -790,17 +1052,40 @@ def find_united_browser_calendar_fares(headless: bool = False) -> dict[str, Fare
             "Playwright is not installed. Run: .venv/bin/python -m pip install playwright"
         ) from e
 
-    UA_BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    month_name = OUTBOUND_START.strftime("%B %Y")
-    results: dict[str, FareResult] = {}
+    try:
+        from playwright_stealth import Stealth
+    except Exception as e:
+        raise RuntimeError(
+            "playwright-stealth missing. Run: "
+            ".venv/bin/python -m pip install playwright-stealth"
+        ) from e
 
-    with sync_playwright() as p:
+    UA_BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    results: dict[str, dict[str, dict[str, FareResult]]] = {}
+
+    stealth = Stealth(navigator_platform_override="MacIntel")
+
+    with stealth.use_sync(sync_playwright()) as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(UA_BROWSER_PROFILE_DIR),
-            headless=headless,
+            channel="chrome",  # use installed Google Chrome, not bundled Chromium
+            # Headed mode (real Chrome) gives the best fingerprint for UA's
+            # bot detection. The window is hidden via AppleScript minimize
+            # right after launch — see _minimize_chrome_for_profile.
+            headless=False,
             viewport={"width": 1440, "height": 1100},
             args=["--disable-blink-features=AutomationControlled"],
         )
+        context.add_init_script(_EXTRA_STEALTH_INIT_JS)
+        # Hide the Chrome window from the user's screen. Has to come AFTER
+        # the context exists (so the window is open) but ideally before any
+        # heavy work. AppleScript needs accessibility permission.
+        time.sleep(0.8)
+        minimized = _minimize_chrome_for_profile(str(UA_BROWSER_PROFILE_DIR))
+        print(f"minimized {minimized} chrome window(s)", flush=True)
+        removed = _purge_recaptcha_cookies(context)
+        if removed:
+            print(f"purged {removed} reputation cookies", flush=True)
         page = context.pages[0] if context.pages else context.new_page()
         try:
             _goto_with_retry(page, "https://www.united.com/en/us/")
@@ -810,15 +1095,21 @@ def find_united_browser_calendar_fares(headless: bool = False) -> dict[str, Fare
             except Exception:
                 pass
 
-            results.update(_scrape_all_cabins_window(page))
+            for window in TRACKED_WINDOWS:
+                label = window["label"]
+                results[label] = {}
+                for mode, cabin_keys in window["modes"].items():
+                    results[label][mode] = _scrape_all_cabins_window(
+                        page,
+                        window["start"],
+                        window["end"],
+                        mode,
+                        cabin_keys,
+                        window_label=label,
+                    )
         finally:
             context.close()
 
-    for _, _, key in TRACKED_CLASSES:
-        results.setdefault(
-            key,
-            FareResult(None, None, None, None, None, 0, "united.com browser"),
-        )
     return results
 
 
@@ -1114,9 +1405,22 @@ def find_united_mileage_signal(api_key: str) -> tuple[str, int | None, str | Non
     return f"Potential UA deal around {best:,} miles", best, src
 
 
-def format_fare(label: str, fare: FareResult) -> str:
+def _format_amount(value: float, mode: str) -> str:
+    if mode == "miles":
+        return f"{value:,.0f} miles"
+    return f"${value:,.0f}"
+
+
+def format_fare(label: str, fare: FareResult, *, mode: str) -> str:
     if fare.price is None:
-        return f"{label}: unavailable"
+        if fare.fallback_price is not None:
+            return (
+                f"{label}: current scrape failed; "
+                f"last known {_format_amount(fare.fallback_price, mode)} "
+                f"for {fare.fallback_depart_date} "
+                f"(scraped {fare.fallback_scraped_on})"
+            )
+        return f"{label}: unavailable (no current data, no history)"
     trip_text = "round trip" if fare.return_date else "one way"
     dates = (
         f"{fare.depart_date} -> {fare.return_date}"
@@ -1124,7 +1428,7 @@ def format_fare(label: str, fare: FareResult) -> str:
         else str(fare.depart_date)
     )
     line = (
-        f"{label}: {fare.price:,.0f} miles {trip_text} "
+        f"{label}: {_format_amount(fare.price, mode)} {trip_text} "
         f"({dates})"
     )
     if fare.airline:
@@ -1158,12 +1462,123 @@ def append_price_history(path: Path, row: dict[str, Any]) -> None:
         f.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
+def prune_old_daily_reports(directory: Path, keep_days: int = 7) -> int:
+    """Delete daily_YYYY-MM-DD.txt files older than `keep_days` (by date stamp,
+    not by mtime). Returns count removed. Cron logs and JSONL stores are never
+    touched here — those are the durable artifacts."""
+    if not directory.exists():
+        return 0
+    files = sorted(directory.glob("daily_*.txt"))
+    if len(files) <= keep_days:
+        return 0
+    removed = 0
+    for f in files[:-keep_days]:
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+
+def log_email(
+    *,
+    recipients: list[str],
+    subject: str,
+    body: str,
+    html_body: str | None,
+    ok: bool,
+    detail: str,
+    transport: str,
+) -> None:
+    _append_jsonl(
+        EMAIL_LOG_FILE,
+        {
+            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+            "transport": transport,
+            "recipients": recipients,
+            "subject": subject,
+            "body": body,
+            "html_body": html_body,
+            "ok": ok,
+            "detail": detail,
+        },
+    )
+
+
+def log_scrape_attempt(
+    *,
+    window_label: str,
+    out_date: dt.date,
+    mode: str,
+    url: str,
+    text: str | None,
+    extracted: dict[str, float | None],
+    error: str | None,
+    elapsed_ms: int,
+) -> None:
+    """Record what UA actually served us so we can debug bot-detection patterns."""
+    text = text or ""
+    body_excerpt = text[:1200]
+    _append_jsonl(
+        SCRAPE_DEBUG_FILE,
+        {
+            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+            "window_label": window_label,
+            "out_date": out_date.isoformat(),
+            "mode": mode,
+            "url": url,
+            "elapsed_ms": elapsed_ms,
+            "error": error,
+            "extracted": extracted,
+            "text_len": len(text),
+            "markers": {
+                "loading_results": "Loading results" in text,
+                "flight_information": "Flight Information" in text,
+                "nonstop": "NONSTOP" in text,
+                "unable_to_complete": "unable to complete" in text,
+                "try_again_later": "try again later" in text,
+                "signed_in": "Hi, enlin" in text,
+                "no_flights_found": "No flights found" in text,
+                "choose_date": "Choose a date" in text,
+            },
+            "body_excerpt": body_excerpt,
+        },
+    )
+
+
 def _find_last_price(rows: list[dict[str, Any]], key: str) -> tuple[float | None, str | None]:
     for row in reversed(rows):
         val = row.get(key)
         if isinstance(val, (int, float)):
             return float(val), str(row.get("date")) if row.get("date") else None
     return None, None
+
+
+def _find_last_known_fare(
+    rows: list[dict[str, Any]],
+    key: str,
+) -> tuple[float | None, str | None, str | None]:
+    """Walk history backwards; return (price, depart_date, scraped_on) of the
+    most recent row where `key` is non-null. Used to fill the email when the
+    current scrape failed for this (window, mode, cabin)."""
+    depart_key = f"{key}_depart"
+    for row in reversed(rows):
+        val = row.get(key)
+        if isinstance(val, (int, float)):
+            depart = row.get(depart_key)
+            return (
+                float(val),
+                str(depart) if depart else None,
+                str(row.get("date")) if row.get("date") else None,
+            )
+    return None, None, None
 
 
 def _collect_prices(rows: list[dict[str, Any]], key: str) -> list[float]:
@@ -1175,60 +1590,100 @@ def _collect_prices(rows: list[dict[str, Any]], key: str) -> list[float]:
     return out
 
 
-def _delta_text(current: float, previous: float) -> str:
+def _delta_text(current: float, previous: float, mode: str) -> str:
     diff = current - previous
     pct = (diff / previous) * 100 if previous else 0.0
+    unit = "miles" if mode == "miles" else "USD"
+    noun = "mileage" if mode == "miles" else "price"
     if abs(diff) < 0.5:
-        return "unchanged vs last tracked price"
+        return f"unchanged vs last tracked {noun}"
     direction = "higher" if diff > 0 else "lower"
-    return f"{direction} by {abs(diff):,.0f} miles ({abs(pct):.1f}%) vs last tracked mileage"
+    return f"{direction} by {abs(diff):,.0f} {unit} ({abs(pct):.1f}%) vs last tracked {noun}"
 
 
-def _buy_signal(current: float, history: list[float]) -> str:
+def _buy_signal(current: float, history: list[float], mode: str) -> str:
     if not history:
         return "No historical baseline yet."
     min_hist = min(history)
     avg_hist = sum(history) / len(history)
+    noun = "mileage" if mode == "miles" else "price"
+    cap = noun.capitalize()
     if current <= min_hist * 1.02:
-        return "Very good mileage deal, please consider booking."
+        return f"Very good {noun} deal, please consider booking."
     if current <= avg_hist * 0.93:
-        return "Good mileage deal, booking is reasonable."
+        return f"Good {noun} deal, booking is reasonable."
     if current >= avg_hist * 1.10:
-        return "Mileage is elevated vs past levels; waiting may be better."
-    return "Mileage is in the normal range."
+        return f"{cap} is elevated vs past levels; waiting may be better."
+    return f"{cap} is in the normal range."
 
 
 def _is_deal_signal(signal: str) -> bool:
-    return signal.startswith("Very good mileage") or signal.startswith("Good mileage")
+    return signal.startswith(("Very good mileage", "Good mileage", "Very good price", "Good price"))
+
+
+def _filter_history(
+    rows: list[dict[str, Any]],
+    window_label: str,
+    window_start: dt.date,
+    mode: str,
+) -> list[dict[str, Any]]:
+    """Return rows for the (window, mode) pair, translating legacy rows on the fly."""
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        row_mode = row.get("fare_mode")
+        row_label = row.get("window_label")
+        if row_mode is not None or row_label is not None:
+            if row_label == window_label and row_mode == mode:
+                out.append(row)
+            continue
+        # Legacy schema (pre-multi-window): single Sep window in miles only.
+        if mode != "miles":
+            continue
+        if row.get("window_start") != window_start.isoformat():
+            continue
+        out.append(
+            {
+                "date": row.get("date"),
+                "economy": row.get("economy_miles"),
+                "premium_economy": row.get("premium_economy_miles"),
+                "economy_depart": row.get("economy_depart"),
+                "premium_economy_depart": row.get("premium_economy_depart"),
+            }
+        )
+    return out
 
 
 def build_price_context(
     label: str,
     fare: FareResult,
     history_rows: list[dict[str, Any]],
-    price_key: str,
+    cabin_key: str,
+    *,
+    mode: str,
 ) -> tuple[list[str], list[str], bool]:
     trend_lines: list[str] = []
     prediction_lines: list[str] = []
+    noun = "mileage" if mode == "miles" else "price"
+    unit = "miles" if mode == "miles" else "USD"
     if fare.price is None:
-        trend_lines.append(f"{label}: no current mileage, unable to compare.")
+        trend_lines.append(f"{label}: no current {noun}, unable to compare.")
         prediction_lines.append(f"{label}: no deal signal.")
         return trend_lines, prediction_lines, False
 
-    last_price, last_date = _find_last_price(history_rows, price_key)
-    hist = _collect_prices(history_rows, price_key)
+    last_price, last_date = _find_last_price(history_rows, cabin_key)
+    hist = _collect_prices(history_rows, cabin_key)
 
     if last_price is not None:
         trend_lines.append(
-            f"{label}: {_delta_text(fare.price, last_price)} (last date: {last_date})"
+            f"{label}: {_delta_text(fare.price, last_price, mode)} (last date: {last_date})"
         )
     else:
-        trend_lines.append(f"{label}: no past tracked mileage yet; baseline created today.")
+        trend_lines.append(f"{label}: no past tracked {noun} yet; baseline created today.")
 
     if hist:
-        signal = _buy_signal(fare.price, hist)
+        signal = _buy_signal(fare.price, hist, mode)
         prediction_lines.append(
-            f"{label}: historical low {min(hist):,.0f} miles; {signal}"
+            f"{label}: historical low {_format_amount(min(hist), mode)}; {signal}"
         )
         return trend_lines, prediction_lines, _is_deal_signal(signal)
 
@@ -1313,60 +1768,77 @@ def parse_recipients(raw: str) -> list[str]:
     return [p for p in parts if p]
 
 
+def _fare_summary_line(label: str, fare: FareResult, mode: str) -> str:
+    if fare.price is None:
+        if fare.fallback_price is not None:
+            return (
+                f"{label}: current N/A — last known "
+                f"{_format_amount(fare.fallback_price, mode)} "
+                f"for {fare.fallback_depart_date} "
+                f"(scraped {fare.fallback_scraped_on})"
+            )
+        return f"{label}: unavailable"
+    return f"{label}: {_format_amount(fare.price, mode)} one way ({fare.depart_date})"
+
+
 def build_concise_email(
-    economy: FareResult,
-    premium_economy: FareResult,
+    scrape: dict[str, dict[str, dict[str, FareResult]]],
     trend_lines: list[str],
     prediction_lines: list[str],
     deal_lines: list[str],
 ) -> tuple[str, str]:
-    def fare_line(label: str, fare: FareResult) -> str:
-        if fare.price is None:
-            return f"{label}: unavailable"
-        trip_text = "round trip" if fare.return_date else "one way"
-        dates = (
-            f"{fare.depart_date} -> {fare.return_date}"
-            if fare.return_date
-            else str(fare.depart_date)
-        )
-        return (
-            f"{label}: {fare.price:,.0f} miles {trip_text} "
-            f"({dates})"
-        )
-
-    text_lines = [
-        "UA SFO -> PVG, Sep 24-30, 2026, non-stop awards only",
-        fare_line("Economy best non-stop", economy),
-        fare_line("Premium economy best non-stop", premium_economy),
+    cabin_labels = {key: label for label, _, key in TRACKED_CLASSES}
+    text_lines: list[str] = ["UA SFO -> PVG non-stop one-way"]
+    html_parts: list[str] = [
+        "<html><body>",
+        "<p><b>UA SFO -&gt; PVG non-stop one-way</b></p>",
     ]
-    if economy.url:
-        text_lines.append(f"Economy link: {economy.url}")
-    if premium_economy.url:
-        text_lines.append(f"Premium economy link: {premium_economy.url}")
+
+    for window in TRACKED_WINDOWS:
+        window_label = window["label"]
+        text_lines.append("")
+        text_lines.append(f"=== {window_label} ===")
+        html_parts.append(f"<p><b>{window_label}</b><br/>")
+        for mode, cabin_keys in window["modes"].items():
+            mode_title = "Miles" if mode == "miles" else "Cash"
+            text_lines.append(f"[{mode_title}]")
+            html_parts.append(f"<i>{mode_title}</i><br/>")
+            for key in cabin_keys:
+                fare = scrape[window_label][mode][key]
+                text_lines.append(_fare_summary_line(cabin_labels[key], fare, mode))
+                if fare.url:
+                    text_lines.append(f"  link: {fare.url}")
+                amount_text = _fare_summary_line(cabin_labels[key], fare, mode)
+                if fare.url:
+                    html_parts.append(
+                        f'{amount_text} — <a href="{fare.url}">link</a><br/>'
+                    )
+                else:
+                    html_parts.append(f"{amount_text}<br/>")
+        html_parts.append("</p>")
+
     text_lines.append("")
     text_lines.append("Deal:")
     text_lines.extend(deal_lines or ["No deal signal yet."])
+    text_lines.append("")
     text_lines.append("Trend:")
     text_lines.extend(trend_lines or ["No trend data yet."])
+    text_lines.append("")
     text_lines.append("Prediction:")
     text_lines.extend(prediction_lines or ["No prediction yet."])
-    text_body = "\n".join(text_lines)
 
-    html = [
-        "<html><body>",
-        "<p><b>UA SFO -&gt; PVG, Sep 24-30, 2026, non-stop awards only</b></p>",
-        f"<p><b>{fare_line('Economy best non-stop', economy)}</b><br/>",
-        (f"<a href=\"{economy.url}\">View economy award</a>" if economy.url else "No link"),
-        "</p>",
-        f"<p><b>{fare_line('Premium economy best non-stop', premium_economy)}</b><br/>",
-        (f"<a href=\"{premium_economy.url}\">View premium economy award</a>" if premium_economy.url else "No link"),
-        "</p>",
-        "<p><b>Deal</b><br/>" + "<br/>".join(deal_lines or ["No deal signal yet."]) + "</p>",
-        "<p><b>Trend</b><br/>" + "<br/>".join(trend_lines or ["No trend data yet."]) + "</p>",
-        "<p><b>Prediction</b><br/>" + "<br/>".join(prediction_lines or ["No prediction yet."]) + "</p>",
-        "</body></html>",
-    ]
-    return text_body, "".join(html)
+    html_parts.append(
+        "<p><b>Deal</b><br/>" + "<br/>".join(deal_lines or ["No deal signal yet."]) + "</p>"
+    )
+    html_parts.append(
+        "<p><b>Trend</b><br/>" + "<br/>".join(trend_lines or ["No trend data yet."]) + "</p>"
+    )
+    html_parts.append(
+        "<p><b>Prediction</b><br/>" + "<br/>".join(prediction_lines or ["No prediction yet."])
+        + "</p>"
+    )
+    html_parts.append("</body></html>")
+    return "\n".join(text_lines), "".join(html_parts)
 
 
 def twilio_request(
@@ -1487,11 +1959,23 @@ def main() -> int:
     sms_to_raw = os.getenv("SMS_TO", "").strip()
 
     today = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    cabin_labels = {key: label for label, _, key in TRACKED_CLASSES}
+
+    def _window_summary_line(w: dict[str, Any]) -> str:
+        parts = []
+        for mode, cabin_keys in w["modes"].items():
+            cabins = "/".join(cabin_labels[k] for k in cabin_keys)
+            parts.append(f"{mode}:{cabins}")
+        return (
+            f"{w['label']} ({w['start'].isoformat()}..{w['end'].isoformat()}) "
+            f"[{', '.join(parts)}]"
+        )
+
     lines = [
         f"Date: {today}",
-        "Route: SFO -> PVG",
-        "Window: depart 2026-09-24..2026-09-30 (one-way non-stop mileage scan)",
-        "Airline: United only | Awards: Economy, Premium economy",
+        "Route: SFO -> PVG | Airline: United only | Non-stop only",
+        "Windows:",
+        *(f"  - {_window_summary_line(w)}" for w in TRACKED_WINDOWS),
         "",
     ]
 
@@ -1499,13 +1983,22 @@ def main() -> int:
 
     history_rows = load_price_history(PRICE_HISTORY_FILE)
 
-    try:
-        class_results = find_united_browser_calendar_fares(headless=browser_headless)
-    except Exception as e:
-        class_results = {
-            key: FareResult(None, None, None, None, None, 0, "united.com browser")
-            for _, _, key in TRACKED_CLASSES
+    def _empty_scrape() -> dict[str, dict[str, dict[str, FareResult]]]:
+        return {
+            w["label"]: {
+                mode: {
+                    key: FareResult(None, None, None, None, None, 0, "united.com browser")
+                    for key in cabin_keys
+                }
+                for mode, cabin_keys in w["modes"].items()
+            }
+            for w in TRACKED_WINDOWS
         }
+
+    try:
+        scrape = find_united_browser_calendar_fares(headless=browser_headless)
+    except Exception as e:
+        scrape = _empty_scrape()
         lines.append(f"United browser search failed: {e}")
         output = "\n".join(lines)
         recipients = parse_recipients(report_email_raw)
@@ -1513,7 +2006,7 @@ def main() -> int:
         if recipients:
             subject = f"Flight report failed {dt.date.today().isoformat()}"
             if smtp_host and smtp_from:
-                send_mail_smtp(
+                ok, detail = send_mail_smtp(
                     subject=subject,
                     body=output,
                     html_body=None,
@@ -1526,53 +2019,88 @@ def main() -> int:
                     use_tls=smtp_tls,
                     use_ssl=smtp_ssl,
                 )
+                log_email(
+                    recipients=recipients,
+                    subject=subject,
+                    body=output,
+                    html_body=None,
+                    ok=ok,
+                    detail=detail,
+                    transport="smtp",
+                )
             else:
-                for addr in recipients:
-                    send_mail_local(subject, output, addr)
+                local_results = [send_mail_local(subject, output, addr) for addr in recipients]
+                all_ok = all(r[0] for r in local_results)
+                detail = next((r[1] for r in local_results if not r[0]), "local mail accepted")
+                log_email(
+                    recipients=recipients,
+                    subject=subject,
+                    body=output,
+                    html_body=None,
+                    ok=all_ok,
+                    detail=detail,
+                    transport="local",
+                )
         out_file = REPORT_DIR / f"daily_{dt.date.today().isoformat()}.txt"
         out_file.write_text(output + "\n", encoding="utf-8")
         notify_macos("Flight report failed: United browser search failed")
         return 1
 
-    economy = class_results["economy"]
-    premium_economy = class_results["premium_economy"]
-
-    lines.append(format_fare("Economy best non-stop", economy))
-    lines.append(format_fare("Premium economy best non-stop", premium_economy))
-    lines.append(
-        "Samples checked: "
-        + f"economy={economy.samples_checked}, "
-        + f"premium_economy={premium_economy.samples_checked}"
-    )
-    lines.append("")
-
-    lines.append("Mileage trend:")
     trend_lines: list[str] = []
     prediction_lines: list[str] = []
     deal_lines: list[str] = []
     any_deal = False
-    for label, _, key in TRACKED_CLASSES:
-        trend, prediction, is_deal = build_price_context(
-            label,
-            class_results[key],
-            history_rows,
-            f"{key}_miles",
-        )
-        trend_lines.extend(trend)
-        prediction_lines.extend(prediction)
-        if is_deal and class_results[key].price is not None:
-            any_deal = True
-            deal_lines.append(
-                f"{label}: DEAL at {class_results[key].price:,.0f} miles on {class_results[key].depart_date}"
-            )
 
+    # Populate last-known fallbacks for any cabin where today's scrape failed.
+    for window in TRACKED_WINDOWS:
+        window_label = window["label"]
+        w_start = window["start"]
+        for mode, cabin_keys in window["modes"].items():
+            filtered_history = _filter_history(history_rows, window_label, w_start, mode)
+            for key in cabin_keys:
+                fare = scrape[window_label][mode][key]
+                if fare.price is None:
+                    fb_price, fb_depart, fb_scraped = _find_last_known_fare(
+                        filtered_history, key
+                    )
+                    fare.fallback_price = fb_price
+                    fare.fallback_depart_date = fb_depart
+                    fare.fallback_scraped_on = fb_scraped
+
+    for window in TRACKED_WINDOWS:
+        window_label = window["label"]
+        w_start = window["start"]
+        lines.append(f"=== {window_label} ===")
+        for mode, cabin_keys in window["modes"].items():
+            mode_title = "Miles" if mode == "miles" else "Cash"
+            lines.append(f"-- {mode_title} --")
+            filtered_history = _filter_history(history_rows, window_label, w_start, mode)
+            for key in cabin_keys:
+                fare = scrape[window_label][mode][key]
+                cabin_label = cabin_labels[key]
+                lines.append(format_fare(f"{cabin_label} best non-stop", fare, mode=mode))
+                trend, prediction, is_deal = build_price_context(
+                    f"{window_label} {mode_title} {cabin_label}",
+                    fare,
+                    filtered_history,
+                    key,
+                    mode=mode,
+                )
+                trend_lines.extend(trend)
+                prediction_lines.extend(prediction)
+                if is_deal and fare.price is not None:
+                    any_deal = True
+                    deal_lines.append(
+                        f"{window_label} {mode_title} {cabin_label}: DEAL at "
+                        f"{_format_amount(fare.price, mode)} on {fare.depart_date}"
+                    )
+        lines.append("")
+
+    lines.append("Trend:")
     lines.extend(trend_lines)
     lines.append("")
     lines.append("Deal signal:")
-    if deal_lines:
-        lines.extend(deal_lines)
-    else:
-        lines.append("No deal detected yet.")
+    lines.extend(deal_lines if deal_lines else ["No deal detected yet."])
     lines.append("")
     lines.append("Prediction:")
     lines.extend(prediction_lines)
@@ -1583,8 +2111,7 @@ def main() -> int:
     mail_ok = False
     mail_detail = "disabled (REPORT_EMAIL empty)"
     email_text, email_html = build_concise_email(
-        economy=economy,
-        premium_economy=premium_economy,
+        scrape=scrape,
         trend_lines=trend_lines,
         prediction_lines=prediction_lines,
         deal_lines=deal_lines,
@@ -1605,6 +2132,15 @@ def main() -> int:
                 use_tls=smtp_tls,
                 use_ssl=smtp_ssl,
             )
+            log_email(
+                recipients=recipients,
+                subject=subject,
+                body=email_text,
+                html_body=email_html,
+                ok=mail_ok,
+                detail=mail_detail,
+                transport="smtp",
+            )
         else:
             results = [send_mail_local(subject, email_text, addr) for addr in recipients]
             mail_ok = all(ok for ok, _ in results)
@@ -1613,6 +2149,15 @@ def main() -> int:
             else:
                 first_err = next((msg for ok, msg in results if not ok), "local mail failed")
                 mail_detail = first_err
+            log_email(
+                recipients=recipients,
+                subject=subject,
+                body=email_text,
+                html_body=email_html,
+                ok=mail_ok,
+                detail=mail_detail,
+                transport="local",
+            )
     lines.append("")
     lines.append(
         "Email delivery: "
@@ -1628,14 +2173,23 @@ def main() -> int:
     sms_detail = "disabled (SMS_TO empty)"
     if sms_targets:
         if twilio_sid and twilio_token and twilio_from:
-            sms_body = "\n".join(
-                [
-                    f"UA SFO->PVG non-stop Sep 24-30 {dt.date.today().isoformat()}",
-                    format_fare("Economy non-stop", economy),
-                    format_fare("Premium economy non-stop", premium_economy),
-                    "Deal: " + ("; ".join(deal_lines) if deal_lines else "none"),
-                ]
-            )
+            sms_lines = [f"UA SFO->PVG {dt.date.today().isoformat()}"]
+            for window in TRACKED_WINDOWS:
+                window_label = window["label"]
+                parts: list[str] = []
+                for mode, cabin_keys in window["modes"].items():
+                    for key in cabin_keys:
+                        fare = scrape[window_label][mode][key]
+                        prefix = "Eco" if key == "economy" else "Prem"
+                        if fare.price is None:
+                            parts.append(f"{prefix} {mode}:-")
+                        elif mode == "miles":
+                            parts.append(f"{prefix} {fare.price:,.0f}mi")
+                        else:
+                            parts.append(f"{prefix} ${fare.price:,.0f}")
+                sms_lines.append(f"{window_label}: " + "; ".join(parts))
+            sms_lines.append("Deal: " + ("; ".join(deal_lines) if deal_lines else "none"))
+            sms_body = "\n".join(sms_lines)
             results = [
                 send_twilio_sms(
                     account_sid=twilio_sid,
@@ -1686,31 +2240,46 @@ def main() -> int:
         )
     )
 
-    append_price_history(
-        PRICE_HISTORY_FILE,
-        {
-            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-            "date": dt.date.today().isoformat(),
-            "route": f"{ORIGIN}-{DEST}",
-            "trip_type": "one_way_award",
-            "window_start": OUTBOUND_START.isoformat(),
-            "window_end": OUTBOUND_END.isoformat(),
-            "economy_miles": economy.price,
-            "premium_economy_miles": premium_economy.price,
-            "economy_depart": economy.depart_date,
-            "premium_economy_depart": premium_economy.depart_date,
-        },
-    )
+    now_iso = dt.datetime.now().isoformat(timespec="seconds")
+    today_iso = dt.date.today().isoformat()
+    for window in TRACKED_WINDOWS:
+        for mode, cabin_keys in window["modes"].items():
+            row: dict[str, Any] = {
+                "timestamp": now_iso,
+                "date": today_iso,
+                "route": f"{ORIGIN}-{DEST}",
+                "trip_type": "one_way",
+                "window_label": window["label"],
+                "window_start": window["start"].isoformat(),
+                "window_end": window["end"].isoformat(),
+                "fare_mode": mode,
+            }
+            for key in cabin_keys:
+                fare = scrape[window["label"]][mode][key]
+                row[key] = fare.price
+                row[f"{key}_depart"] = fare.depart_date
+            append_price_history(PRICE_HISTORY_FILE, row)
     output = "\n".join(lines)
 
     out_file = REPORT_DIR / f"daily_{dt.date.today().isoformat()}.txt"
     out_file.write_text(output + "\n", encoding="utf-8")
+    prune_old_daily_reports(REPORT_DIR, keep_days=7)
 
-    summary = []
-    if economy.price is not None:
-        summary.append(f"Eco {economy.price:,.0f} mi")
-    if premium_economy.price is not None:
-        summary.append(f"PremEco {premium_economy.price:,.0f} mi")
+    summary: list[str] = []
+    for window in TRACKED_WINDOWS:
+        window_label = window["label"]
+        parts: list[str] = []
+        for mode, cabin_keys in window["modes"].items():
+            for key in cabin_keys:
+                fare = scrape[window_label][mode][key]
+                prefix = "Eco" if key == "economy" else "Prem"
+                if fare.price is None:
+                    parts.append(f"{prefix} {mode}:-")
+                elif mode == "miles":
+                    parts.append(f"{prefix} {fare.price:,.0f}mi")
+                else:
+                    parts.append(f"{prefix} ${fare.price:,.0f}")
+        summary.append(f"{window_label}: " + ", ".join(parts))
     if deal_lines:
         summary.append("DEAL")
 
